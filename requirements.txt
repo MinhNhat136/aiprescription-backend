@@ -1,0 +1,23 @@
+# FastAPI backend
+fastapi[standard]==0.135.3
+uvicorn[standard]>=0.43.0
+pydantic>=2.9
+pydantic-settings>=2.0
+python-multipart
+
+# Database
+sqlalchemy[asyncio]>=2.0.49
+asyncpg>=0.31.0
+alembic
+
+# Speech-to-Text (faster-whisper for local GPU acceleration)
+faster-whisper==1.2.1
+ctranslate2>=4.0.0
+
+# Testing
+pytest==9.0.2
+pytest-asyncio==1.3.0
+httpx==0.28.1
+
+# PDF processing (for future phases)
+pdfplumber>=0.11.0
