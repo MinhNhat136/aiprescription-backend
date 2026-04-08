@@ -11,8 +11,13 @@ from app.services.stt_service import initialize_stt_service
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan context manager for startup/shutdown events."""
-    # Startup: Initialize Whisper model (10-30 seconds)
-    initialize_stt_service(model_size=settings.whisper_model, device=settings.device)
+    # Startup: Initialize Whisper model (10-30 seconds on first run for download)
+    initialize_stt_service(
+        model_size=settings.whisper_model,
+        device=settings.device,
+        model_path=settings.whisper_model_path,
+        hf_home=settings.hf_home,
+    )
     yield
     # Shutdown: Cleanup if needed
 
