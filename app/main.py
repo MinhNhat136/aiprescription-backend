@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.config import settings
-from app.routers import health, stt
+from app.routers import audio, health, stt
 from app.services.stt_service import initialize_stt_service
 
 
@@ -35,6 +35,7 @@ def create_app() -> FastAPI:
     )
     app.include_router(health.router)
     app.include_router(stt.router)
+    app.include_router(audio.router)
     return app
 
 

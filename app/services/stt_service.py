@@ -1,7 +1,10 @@
 """Whisper STT service with GPU detection and configurable model storage."""
 import asyncio
+import io
 import os
+import tempfile
 from abc import ABC, abstractmethod
+from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Optional
 
@@ -24,6 +27,51 @@ class STTServiceInterface(ABC):
 
         Returns:
             str: Transcribed text.
+        """
+        pass
+
+    @abstractmethod
+    async def transcribe_bytes(
+        self, audio_data: bytes, file_extension: str = ".webm", language: str = "vi"
+    ) -> str:
+        """Transcribe raw audio bytes to text.
+
+        Writes audio bytes to a temporary file, transcribes, and cleans up.
+
+        Args:
+            audio_data: Raw audio bytes.
+            file_extension: File extension for the temporary file (default: .webm).
+            language: Language code for transcription (default: Vietnamese).
+
+        Returns:
+            str: Transcribed text.
+        """
+        pass
+
+    @abstractmethod
+    async def transcribe_stream(
+        self,
+        audio_chunks: AsyncGenerator[bytes, None],
+        file_extension: str = ".webm",
+        language: str = "vi",
+        partial_interval: float = 2.0,
+    ) -> AsyncGenerator[dict, None]:
+        """Stream transcribe audio chunks with partial results.
+
+        Receives audio chunks via async generator and yields partial
+        transcription results at regular intervals, followed by a final
+        result when the stream ends.
+
+        Args:
+            audio_chunks: Async generator yielding audio bytes.
+            file_extension: File extension for audio format (default: .webm).
+            language: Language code for transcription (default: Vietnamese).
+            partial_interval: Seconds between partial transcriptions (default: 2.0).
+
+        Yields:
+            dict: Transcription result with keys:
+                - text: str - Transcribed text
+                - is_final: bool - True for the last result
         """
         pass
 
@@ -122,6 +170,12 @@ class FasterWhisperService(STTServiceInterface):
     def _detect_device(self) -> str:
         """Detect available device, preferring GPU.
 
+        Verifies both GPU driver presence (via ctranslate2) and CUDA runtime
+        library availability (cuBLAS). This prevents selecting "cuda" when
+        the driver is present but CUDA toolkit libraries are missing — a
+        common issue on Windows where the GPU driver is installed but the
+        CUDA toolkit is not on PATH.
+
         Returns:
             str: Device to use ("cuda" or "cpu").
         """
@@ -130,8 +184,29 @@ class FasterWhisperService(STTServiceInterface):
 
             gpu_count = ctranslate2.get_cuda_device_count()
             if gpu_count > 0:
-                logger.info(f"CUDA available: {gpu_count} GPU(s) detected")
-                return "cuda"
+                # GPU driver found, but verify cuBLAS is loadable.
+                # CTranslate2 needs cuBLAS at inference time; detecting the
+                # GPU alone is insufficient.
+                try:
+                    import ctypes
+                    import platform
+
+                    if platform.system() == "Windows":
+                        ctypes.CDLL("cublas64_12.dll")
+                    else:
+                        ctypes.CDLL("libcublas.so.12")
+                    logger.info(
+                        f"CUDA available: {gpu_count} GPU(s) detected, cuBLAS verified"
+                    )
+                    return "cuda"
+                except OSError as cublas_err:
+                    logger.warning(
+                        f"CUDA GPU detected but cuBLAS not loadable: {cublas_err}. "
+                        f"Install CUDA toolkit or add its libraries to PATH. "
+                        f"Falling back to CPU."
+                    )
+                    self.device = "cpu"
+                    return "cpu"
         except Exception as e:
             logger.warning(f"CUDA detection failed: {e}")
         logger.info("Falling back to CPU device")
@@ -160,6 +235,117 @@ class FasterWhisperService(STTServiceInterface):
             return "".join([segment.text for segment in segments])
 
         return await asyncio.to_thread(_transcribe_sync)
+
+    async def transcribe_bytes(
+        self, audio_data: bytes, file_extension: str = ".webm", language: str = "vi"
+    ) -> str:
+        """Transcribe raw audio bytes to text.
+
+        Writes audio bytes to a temporary file, transcribes it, and cleans up.
+
+        Args:
+            audio_data: Raw audio bytes.
+            file_extension: File extension for the temporary file (default: .webm).
+            language: Language code for transcription (default: Vietnamese).
+
+        Returns:
+            str: Transcribed text.
+
+        Raises:
+            RuntimeError: If model not initialized.
+        """
+        if not self._initialized or self.model is None:
+            raise RuntimeError("Whisper model not initialized")
+
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                delete=False, suffix=file_extension
+            ) as tmp:
+                tmp.write(audio_data)
+                tmp_path = Path(tmp.name)
+
+            # Reuse the file-based transcription
+            return await self.transcribe(str(tmp_path), language=language)
+        finally:
+            if tmp_path and tmp_path.exists():
+                tmp_path.unlink()
+
+    async def transcribe_stream(
+        self,
+        audio_chunks: AsyncGenerator[bytes, None],
+        file_extension: str = ".webm",
+        language: str = "vi",
+        partial_interval: float = 2.0,
+    ) -> AsyncGenerator[dict, None]:
+        """Stream transcribe audio chunks with partial results.
+
+        Accumulates audio chunks and periodically transcribes the growing
+        buffer to produce partial results. Yields a final result when
+        the audio stream ends.
+
+        Args:
+            audio_chunks: Async generator yielding audio bytes.
+            file_extension: File extension for audio format (default: .webm).
+            language: Language code for transcription (default: Vietnamese).
+            partial_interval: Seconds between partial transcriptions (default: 2.0).
+
+        Yields:
+            dict: Transcription result with keys:
+                - text: str - Transcribed text
+                - is_final: bool - True for the last result
+        """
+        if not self._initialized or self.model is None:
+            raise RuntimeError("Whisper model not initialized")
+
+        buffer = bytearray()
+        last_partial_time = asyncio.get_event_loop().time()
+
+        async for chunk in audio_chunks:
+            buffer.extend(chunk)
+            elapsed = asyncio.get_event_loop().time() - last_partial_time
+
+            if elapsed >= partial_interval and len(buffer) > 0:
+                partial_text = await self._transcribe_buffer(bytes(buffer), file_extension, language)
+                last_partial_time = asyncio.get_event_loop().time()
+                if partial_text:
+                    yield {"text": partial_text, "is_final": False}
+
+        # Final transcription of the complete buffer
+        if len(buffer) > 0:
+            final_text = await self._transcribe_buffer(bytes(buffer), file_extension, language)
+            yield {"text": final_text, "is_final": True}
+        else:
+            yield {"text": "", "is_final": True}
+
+    async def _transcribe_buffer(
+        self, audio_data: bytes, file_extension: str = ".webm", language: str = "vi"
+    ) -> str:
+        """Transcribe an audio buffer by writing to a temp file.
+
+        Args:
+            audio_data: Complete audio bytes.
+            file_extension: File extension for the temp file.
+            language: Language code for transcription.
+
+        Returns:
+            str: Transcribed text, or empty string on error.
+        """
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                delete=False, suffix=file_extension
+            ) as tmp:
+                tmp.write(audio_data)
+                tmp_path = Path(tmp.name)
+
+            return await self.transcribe(str(tmp_path), language=language)
+        except Exception as e:
+            logger.warning(f"Partial transcription failed (possibly incomplete audio): {e}")
+            return ""
+        finally:
+            if tmp_path and tmp_path.exists():
+                tmp_path.unlink()
 
     def get_status(self) -> dict:
         """Get the current status of the STT service.
